@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sequent — gapless document numbering playground</title>
+    <meta
+      name="description"
+      content="An in-browser, zero-backend playground for sequent: allocate a live run of formatted invoice numbers, watch two tenants never collide, cross a New Year to see the counter reset, and see exactly how a mid-transaction crash burns a number — all computed by the pure Go numbering core compiled to WebAssembly."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <!-- The Go WebAssembly runtime shim. Relative path so the site works at /sequent/. -->
+    <script src="wasm_exec.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <h1>sequent</h1>
+        <p class="tagline">the run that never gaps — a clickable playground</p>
+        <nav class="links">
+          <a href="https://github.com/zkrebbekx/sequent" rel="noopener">Repo</a>
+          <a href="https://github.com/zkrebbekx/sequent/blob/main/docs/DESIGN.md" rel="noopener">Design</a>
+          <a href="https://pkg.go.dev/github.com/zkrebbekx/sequent" rel="noopener">API docs</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <p>
+          <strong>sequent</strong> turns an instant into the next document
+          number — <code>INV-2026-00042</code>, then <code>INV-2026-00043</code>,
+          never a gap, reset each year. A <em>Format</em> is a validated template
+          (<code>INV-{year}-{seq:05}</code>) plus a <em>reset policy</em> and a
+          timezone. <em>Allocate</em> derives the period key from the instant,
+          asks a <em>Store</em> for the next counter under that
+          <em>(tenant, series, period)</em>, and renders the template — one call,
+          one number. The counter restarts at 1 whenever the period rolls over,
+          because the reset simply falls out of the key.
+        </p>
+        <p class="teaching-note">
+          Gaplessness is a <strong>durability</strong> property, not a formatting
+          one: a number is only truly gapless when it is allocated in the same
+          committed transaction as the document it numbers. sequent owns the
+          deterministic parts and leaves the atomic increment to your database.
+          Everything below runs in your tab over the pure library compiled to
+          WebAssembly — no backend, no network. Each ledger keeps its own counter
+          for the session; reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/sequent" rel="noopener">zkrebbekx/sequent</a>.
+        </p>
+      </section>
+
+      <section class="scenarios" aria-label="Scenarios">
+        <span class="scenarios-label">Start with a story:</span>
+        <div id="scenario-buttons" class="scenario-buttons"></div>
+      </section>
+      <p id="scenario-note" class="scenario-note" hidden></p>
+
+      <!-- ============ FLAGSHIP 1: live allocation ledger ============ -->
+      <section class="panel" id="panel-ledger" aria-label="Live allocation ledger">
+        <h2>The live ledger — allocate a real run</h2>
+        <p class="panel-sub">
+          Build a template, pick a reset policy, and press <strong>Allocate</strong>.
+          Each press draws the next counter from a real in-memory
+          <code>Store</code> and renders it, so the run marches
+          <code>00001</code>, <code>00002</code>, <code>00003</code>… The
+          <em>next render</em> preview updates as you type; a bad template
+          (<code>ErrBadTemplate</code>) or one with no <code>{seq}</code>
+          (<code>ErrNoSeq</code>) fails here, at construction, never silently.
+        </p>
+        <div class="flag-body">
+          <div class="flag-controls">
+            <label class="field"><span>Template</span>
+              <input id="lg-tmpl" type="text" spellcheck="false" value="INV-{year}-{seq:05}" />
+            </label>
+            <div class="grid2">
+              <label class="field"><span>Reset policy</span>
+                <select id="lg-reset">
+                  <option value="never">Never</option>
+                  <option value="yearly" selected>Yearly</option>
+                  <option value="monthly">Monthly</option>
+                  <option value="daily">Daily</option>
+                </select>
+              </label>
+              <label class="field"><span>Date of issue</span>
+                <input id="lg-at" type="date" value="2026-03-14" />
+              </label>
+            </div>
+            <div class="grid2">
+              <label class="field"><span>Tenant <em>(scope)</em></span>
+                <input id="lg-tenant" type="text" spellcheck="false" value="acme" />
+              </label>
+              <label class="field"><span>Series <em>(scope)</em></span>
+                <input id="lg-series" type="text" spellcheck="false" value="INV" />
+              </label>
+            </div>
+            <div class="preview-box">
+              <span class="preview-label">Next render</span>
+              <span id="lg-preview" class="preview-value">—</span>
+              <span id="lg-key" class="key-line"></span>
+            </div>
+            <div class="seg-row">
+              <button id="lg-allocate" class="btn" type="button">Allocate ▸</button>
+              <button id="lg-clear" class="btn ghost small" type="button">Clear ledger</button>
+            </div>
+          </div>
+          <div class="flag-visual">
+            <div class="ledger-head">
+              <span class="ledger-title">Issued numbers</span>
+              <span class="counter-read">counter <b id="lg-count">0</b></span>
+            </div>
+            <div id="lg-ledger" class="ledger" aria-live="polite">
+              <p id="lg-empty" class="ledger-empty">No numbers yet — press <b>Allocate</b> to draw the first.</p>
+            </div>
+            <p class="chart-cap">
+              Each chip is one committed allocation. The counter is per
+              <em>(tenant, series, period)</em>; change the tenant, the series, or
+              cross a period boundary and a fresh run begins at 1.
+            </p>
+          </div>
+        </div>
+        <p id="lg-err" class="err-banner" hidden></p>
+      </section>
+
+      <!-- ============ FLAGSHIP 2: scope isolation ============ -->
+      <section class="panel" id="panel-scope" aria-label="Scope isolation">
+        <h2>Scope isolation — two tenants, one instant, no collision</h2>
+        <p class="panel-sub">
+          One <code>Store</code>, two scopes. Both sides allocate the
+          <em>same</em> template at the <em>same</em> instant, yet each starts at
+          1 and neither ever touches the other, because the Store key carries the
+          tenant and series. The key is <strong>length-prefixed</strong>
+          (<code>4:acme3:INV4:2026</code>), so no tenant — however adversarial,
+          even one containing the delimiter — can merge two runs into one.
+        </p>
+        <div class="scope-controls">
+          <div class="grid2">
+            <label class="field"><span>Reset policy</span>
+              <select id="sc-reset">
+                <option value="never">Never</option>
+                <option value="yearly" selected>Yearly</option>
+                <option value="monthly">Monthly</option>
+                <option value="daily">Daily</option>
+              </select>
+            </label>
+            <label class="field"><span>Instant (shared)</span>
+              <input id="sc-at" type="date" value="2026-06-01" />
+            </label>
+          </div>
+          <div class="seg-row">
+            <button id="sc-allocate" class="btn" type="button">Allocate on both ▸</button>
+            <button id="sc-clear" class="btn ghost small" type="button">Clear both</button>
+          </div>
+        </div>
+        <div class="two-col scope-pair">
+          <div class="scope-side">
+            <div class="grid2">
+              <label class="field"><span>Tenant A</span><input id="sc-a-tenant" type="text" spellcheck="false" value="acme" /></label>
+              <label class="field"><span>Series A</span><input id="sc-a-series" type="text" spellcheck="false" value="INV" /></label>
+            </div>
+            <div class="ledger-head"><span class="ledger-title">Tenant A</span><span class="counter-read">counter <b id="sc-a-count">0</b></span></div>
+            <div id="sc-a-ledger" class="ledger compact" aria-live="polite"></div>
+            <span id="sc-a-key" class="key-line"></span>
+          </div>
+          <div class="scope-side">
+            <div class="grid2">
+              <label class="field"><span>Tenant B</span><input id="sc-b-tenant" type="text" spellcheck="false" value="globex" /></label>
+              <label class="field"><span>Series B</span><input id="sc-b-series" type="text" spellcheck="false" value="INV" /></label>
+            </div>
+            <div class="ledger-head"><span class="ledger-title">Tenant B</span><span class="counter-read">counter <b id="sc-b-count">0</b></span></div>
+            <div id="sc-b-ledger" class="ledger compact" aria-live="polite"></div>
+            <span id="sc-b-key" class="key-line"></span>
+          </div>
+        </div>
+        <p id="sc-collision" class="frac-line"></p>
+        <p id="sc-err" class="err-banner" hidden></p>
+      </section>
+
+      <!-- ============ FLAGSHIP 3: period reset ============ -->
+      <section class="panel" id="panel-reset" aria-label="Period reset">
+        <h2>Period reset — advance the clock across the boundary</h2>
+        <p class="panel-sub">
+          Allocate a few numbers, then step the clock forward. When the civil
+          period rolls over — the year under <em>Yearly</em>, the month under
+          <em>Monthly</em>, the day under <em>Daily</em> — the counter falls back
+          to 1. There is <strong>no reset code</strong>: the period key changed,
+          so the <code>Store</code> hands out a fresh counter. The template shows
+          the period so you can watch it roll.
+        </p>
+        <div class="reset-controls">
+          <div class="seg" role="group" aria-label="Reset policy">
+            <button id="rs-yearly" class="active" type="button">Yearly</button>
+            <button id="rs-monthly" type="button">Monthly</button>
+            <button id="rs-daily" type="button">Daily</button>
+          </div>
+          <div class="clock">
+            <span class="clock-label">Clock</span>
+            <b id="rs-clock" class="clock-val">2026-12-30</b>
+            <div class="clock-steps">
+              <button id="rs-minus-day" class="btn ghost small" type="button">− day</button>
+              <button id="rs-plus-day" class="btn ghost small" type="button">+ day</button>
+              <button id="rs-plus-month" class="btn ghost small" type="button">+ month</button>
+              <button id="rs-newyear" class="btn ghost small" type="button">↦ next Jan 1</button>
+            </div>
+          </div>
+          <div class="seg-row">
+            <button id="rs-allocate" class="btn" type="button">Allocate ▸</button>
+            <button id="rs-clear" class="btn ghost small" type="button">Clear ledger</button>
+          </div>
+        </div>
+        <div id="rs-ledger" class="ledger period-ledger" aria-live="polite">
+          <p id="rs-empty" class="ledger-empty">Allocate on Dec 30, then step to Jan 1 and allocate again.</p>
+        </div>
+        <p class="chart-cap">
+          A divider marks each period roll. The number after it restarts at 1 —
+          the reset is the key change, nothing more.
+        </p>
+        <p id="rs-err" class="err-banner" hidden></p>
+      </section>
+
+      <div class="two-col">
+        <!-- ============ gapless vs the trap ============ -->
+        <section class="panel" id="panel-gapless" aria-label="Gapless vs the trap">
+          <h2>Gapless vs the trap</h2>
+          <p class="panel-sub">
+            The same allocation, two ways to use the <code>Store</code>. Choose
+            how the number binds to the document, then save it — or let the save
+            fail. Watch what a failure does to the run.
+          </p>
+          <div class="seg" role="group" aria-label="Binding" style="margin-bottom:12px;">
+            <button id="gp-correct" class="active" type="button">Bind to transaction</button>
+            <button id="gp-trap" type="button">Allocate, then create</button>
+          </div>
+          <div class="seg-row">
+            <button id="gp-save" class="btn" type="button">Save document ✓</button>
+            <button id="gp-fail" class="btn danger" type="button">Fail the document ✕</button>
+            <button id="gp-clear" class="btn ghost small" type="button">Clear</button>
+          </div>
+          <div id="gp-ledger" class="ledger" aria-live="polite">
+            <p id="gp-empty" class="ledger-empty">Save a few documents, then fail one and watch the run.</p>
+          </div>
+          <p id="gp-note" class="gp-note"></p>
+          <p id="gp-err" class="err-banner" hidden></p>
+        </section>
+
+        <!-- ============ timezone ============ -->
+        <section class="panel" id="panel-tz" aria-label="Timezone">
+          <h2>Timezone — which year is this invoice in?</h2>
+          <p class="panel-sub">
+            "Which year is this invoice in" is a <em>civil-date</em> question, so
+            the period follows the Format's timezone, not the server's wall clock.
+            A Format built in UTC reads the instant in UTC before it picks the
+            year. An instant just after midnight in Tokyo is still the old year in
+            UTC — so it belongs to the old year's run.
+          </p>
+          <div class="seg-row">
+            <button id="tz-tokyo" class="btn" type="button">Tokyo New Year (+09:00)</button>
+            <button id="tz-utc" class="btn ghost" type="button">UTC New Year</button>
+          </div>
+          <div id="tz-out" class="tz-out"></div>
+          <p id="tz-err" class="err-banner" hidden></p>
+        </section>
+      </div>
+
+      <footer class="footer">
+        <p>
+          Runs entirely in your tab over the pure numbering core compiled to
+          WebAssembly — no backend, no network. Counters live only for this
+          session; reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/sequent" rel="noopener">zkrebbekx/sequent</a>.
+        </p>
+      </footer>
+    </main>
+
+    <div id="boot" class="boot">Loading the sequent engine…</div>
+  </body>
+</html>
